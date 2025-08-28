@@ -48,3 +48,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# À ajouter après le dataframe
+if st.button("📄 Générer PDF simple"):
+    # Création PDF basique
+    st.success("PDF généré ! (prochaine étape)")
+
