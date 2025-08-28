@@ -6,8 +6,6 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 from io import BytesIO
-from config.settings import get_config
-from utils.data_manager import load_data_from_file, validate_dataframe
 from utils.image_processing import get_image, process_images
 
 from utils.image_processing import get_image, get_hex_color_safe, open_image, process_images
