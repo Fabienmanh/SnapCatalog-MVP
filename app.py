@@ -1,24 +1,12 @@
-
 import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime
 from pathlib import Path
 import tempfile
-
-from utils.image_processing import get_image, get_hex_color_safe, open_image, process_images
-
-# EN HAUT de app.py, ajoutez :
-from utils.font_manager import download_and_register_fonts, get_font_name
-from reportlab.lib.units import cm
-from utils.helpers import update_progress_detailed
-
-from pdf.pdf_generator import generate_pdf_with_progress, generate_pdf_with_quality
-
-# Nos modules
-from upload_handler import UploadHandler
-from pdf_designer import CatalogDesigner, generate_modern_catalog_with_progress, generate_pdf_with_quality
-from utils.data_processing import save_feedback_to_csv, save_feedback_to_sqlite, get_feedback_stats, detect_csv_type
+from PIL import Image
+import io
+import base64
 
 # Optionnel: aperçu PDF
 try:
