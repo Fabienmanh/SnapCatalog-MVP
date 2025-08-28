@@ -5,7 +5,6 @@ import os
 from datetime import datetime
 from pathlib import Path
 import tempfile
-from utils.image_processing import get_image, process_images
 
 from utils.image_processing import get_image, get_hex_color_safe, open_image, process_images
 
