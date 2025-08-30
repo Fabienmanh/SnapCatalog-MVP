@@ -1,6 +1,6 @@
 # SnapCatalog
 
-Générez facilement vos catalogues PDF à partir d’un fichier CSV, Excel, ou JSON.  
+Générez facilement vos catalogues PDF à partir d’un fichier CSV.
 Personnalisez la mise en page, importez des images et exportez un catalogue prêt à imprimer !
 
 ## Fonctionnalités
