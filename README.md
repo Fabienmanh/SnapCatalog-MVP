@@ -9,7 +9,7 @@ Personnalisez la mise en page, importez des images et exportez un catalogue prê
 - Création manuelle page par page
 - Génération de PDF mise en page A4 pro
 - Insertion automatique des images produits
-- Export CSV/JSON des fiches manuelles
+- Export CSV
 
 ## Lancer l’application
 
