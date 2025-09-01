@@ -1,3 +1,5 @@
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://snacatalog.streamlit.app)
+
 # SnapCatalog
 
 Générez facilement vos catalogues PDF à partir d’un fichier CSV.
