@@ -6,7 +6,6 @@ Personnalisez la mise en page, importez des images et exportez un catalogue prê
 ## Fonctionnalités
 
 - Import CSV
-- Création manuelle page par page
 - Génération de PDF mise en page A4 pro
 - Insertion automatique des images produits
 - Export CSV
