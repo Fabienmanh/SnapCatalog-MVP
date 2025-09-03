@@ -1,3 +1,4 @@
+import io, re, requests
 import streamlit as st
 import pandas as pd
 import os
@@ -5,6 +6,10 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 from io import BytesIO
+from PIL import Image
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 
 # Imports des modules utilitaires
 from utils.font_manager import download_and_register_fonts, validate_background_color
@@ -62,6 +67,161 @@ def safe_generate_pdf(products, **kw):
             st.info("💡 Essayez de réduire le nombre de colonnes ou de produits par page.")
             raise e2
 
+# -------- Réglages pour génération PDF avec images URL
+PAGE_W, PAGE_H = A4
+MARGIN = 36
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; Snacatalog/1.0)",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+IMG_COLS = [f"IMAGE {i}" for i in range(1, 11)]
+TITLE_COL = "TITRE"           # Adapter si besoin
+DESC_COL  = "DESCRIPTION"     # Adapter si besoin
+PRICE_COL = "PRIX"
+CURR_COL  = "CODE_DEVISE"
+REF_COL   = "RÉFÉRENCE"
+
+# -------- Utilitaires pour images URL
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_image_bytes(url: str) -> bytes | None:
+    url = (url or "").strip()
+    if not url:
+        return None
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "")
+        if "image" not in ct and not re.search(r"\.(png|jpe?g|webp|gif|bmp|tiff)$", url, re.I):
+            return None
+        return r.content
+    except Exception:
+        return None
+
+def load_pil_image_from_url(url: str) -> Image.Image | None:
+    data = fetch_image_bytes(url)
+    if not data:
+        return None
+    try:
+        img = Image.open(io.BytesIO(data))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        return img
+    except Exception:
+        return None
+
+# Nettoie une cellule potentiellement "sale" et en extrait des URLs d'images
+IMG_URL_RE = re.compile(r"https?://[^\s\"']+?\.(?:png|jpe?g|webp|gif|bmp|tiff)(?:\?[^\s\"']*)?", re.I)
+
+def extract_image_urls_from_cell(cell: str) -> list[str]:
+    s = str(cell or "")
+    # Cas d'erreurs repérées dans ton CSV: préfixes bizarres ";ps://", morceaux coupés, etc.
+    s = s.replace(";ps://", "https://")
+    # Récupère toute URL plausible d'image dans la cellule
+    urls = IMG_URL_RE.findall(s)
+    # Déduplication + trim
+    seen, out = set(), []
+    for u in urls:
+        u = u.strip()
+        if u and u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+def extract_row_image_urls(row: pd.Series) -> list[str]:
+    urls = []
+    for col in IMG_COLS:
+        if col in row:
+            urls.extend(extract_image_urls_from_cell(row[col]))
+    # Garde 1–4 images max par item pour limiter la taille du PDF
+    return urls[:4]
+
+def draw_image_keep_aspect(c, pil_img, x, y, max_w, max_h):
+    w, h = pil_img.size
+    scale = min(max_w / w, max_h / h)
+    nw, nh = w * scale, h * scale
+    c.drawImage(ImageReader(pil_img), x, y, width=nw, height=nh, preserveAspectRatio=True, mask='auto')
+    return nw, nh
+
+def build_pdf_from_df(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    y = PAGE_H - MARGIN
+    max_img_w = PAGE_W - 2*MARGIN
+    max_img_h = 260
+
+    for _, row in df.iterrows():
+        title = str(row.get(TITLE_COL, "") or "").strip() or "Sans titre"
+        desc  = str(row.get(DESC_COL, "") or "").strip()
+        price = str(row.get(PRICE_COL, "") or "").strip()
+        curr  = str(row.get(CURR_COL, "") or "").strip()
+        ref   = str(row.get(REF_COL, "") or "").strip()
+
+        urls = extract_row_image_urls(row)
+
+        # Espace requis par le bloc (images + textes). On force un saut si trop bas.
+        block_min_h = max_img_h + 80
+        if y - block_min_h < MARGIN:
+            c.showPage(); y = PAGE_H - MARGIN
+
+        # Images (jusqu'à 2 par ligne, 2 lignes = 4 max)
+        cols = 2
+        cell_w = (max_img_w - 12) / cols
+        cell_h = (max_img_h - 12) / 2
+        top_y = y
+
+        for idx, url in enumerate(urls):
+            pil_img = load_pil_image_from_url(url)
+            r = idx // cols
+            cidx = idx % cols
+            # Position de la cellule
+            cx = MARGIN + cidx * (cell_w + 12)
+            cy = top_y - (r+1) * (cell_h + 12)
+            if pil_img:
+                # Marges internes de 6pt
+                draw_image_keep_aspect(c, pil_img, cx+6, cy+6, cell_w-12, cell_h-12)
+            else:
+                # Placeholder si image KO
+                c.setFillColorRGB(0.92,0.92,0.92)
+                c.rect(cx, cy, cell_w, cell_h, fill=1, stroke=0)
+                c.setFillColorRGB(0,0,0)
+                c.setFont("Helvetica", 9)
+                c.drawString(cx+8, cy+8, "Image indisponible")
+
+        # Si pas d'URL valide, réserver une zone placeholder
+        if not urls:
+            cy = top_y - cell_h
+            c.setFillColorRGB(0.95,0.95,0.95)
+            c.rect(MARGIN, cy, max_img_w, cell_h, fill=1, stroke=0)
+            c.setFillColorRGB(0,0,0)
+
+        # Texte
+        y = top_y - max(2 * (cell_h + 12), cell_h + 12) - 8
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(MARGIN, y, title[:120])
+        y -= 16
+
+        small = []
+        if ref:   small.append(f"Réf: {ref}")
+        if price: small.append(f"Prix: {price} {curr}".strip())
+        c.setFont("Helvetica", 9)
+        if small:
+            c.drawString(MARGIN, y, " · ".join(small))
+            y -= 12
+
+        # Description (ligne simple; pour multi-lignes, faire un wrap simple)
+        if desc:
+            c.setFont("Helvetica", 9)
+            c.drawString(MARGIN, y, desc.replace("\n", " ")[:180])
+            y -= 14
+
+        # Espace après l'item
+        y -= 12
+        if y < MARGIN + 150:
+            c.showPage(); y = PAGE_H - MARGIN
+
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
 # État initial pour éviter la double génération
 if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = None
@@ -72,6 +232,14 @@ if "pdf_tmp_path" not in st.session_state:
 st.set_page_config(page_title="SnapCatalog, votre catalogue en un clin d'oeil", layout="wide")
 st.title("📒 SnapCatalog — Générateur de PDF produits")
 st.write("Importe ton fichier produits (Shopify, Etsy…), sélectionne tes colonnes, choisis un template et génère ton catalogue au format PDF!")
+
+# Mode de génération
+st.subheader("🔧 Mode de génération")
+generation_mode = st.radio(
+    "Choisissez le mode de génération :",
+    ["Mode standard (avec images locales)", "Mode images URL (pour CSV Etsy avec URLs)"],
+    index=0
+)
 
 # NOUVEAU : Section de personnalisation (placée tôt pour qu'elle s'affiche toujours)
 st.subheader("🎨 Personnalisation du PDF")
@@ -175,100 +343,139 @@ else:
 # --- GÉNÉRATION DU PDF ---
 st.subheader("🚀 Génération du PDF")
 
-# Qualité fixée en HD par défaut
-selected_quality = "hd"
-
-# Option d'aperçu
-preview = st.checkbox("Afficher un aperçu (lent)", value=False, disabled=not HAVE_PDF2IMAGE)
-if not HAVE_PDF2IMAGE and preview:
-    st.info("pdf2image non disponible pour l'aperçu.")
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    if st.button("Générer le PDF catalogue 🚀"):
-        # Barre de progression
-        st.session_state.progress_bar = st.progress(0)
-        st.session_state.status_text = st.empty()
-        progress_bar = st.session_state.progress_bar
-        status_text = st.session_state.status_text
-        
+if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
+    # Mode images URL
+    st.info("📡 Mode images URL activé - Les images seront téléchargées depuis les URLs du CSV")
+    
+    if st.button("Générer le PDF avec images URL 🚀"):
         try:
-            # Étape 1: Préparation des données (5%)
-            status_text.text("🔄 Préparation des données...")
-            progress_bar.progress(0.05)
+            # Assurer la présence des colonnes image (certaines peuvent manquer)
+            for col in IMG_COLS:
+                if col not in filtered_df.columns:
+                    filtered_df[col] = ""
             
-            # Enregistrement des polices système (10%)
-            status_text.text("🔤 Enregistrement des polices...")
-            download_and_register_fonts()
-            progress_bar.progress(0.10)
+            pdf_bytes = build_pdf_from_df(filtered_df)
+            st.session_state.pdf_bytes = pdf_bytes
+            st.session_state.pdf_name = "catalog_images_url.pdf"
             
-            # Conversion des données (15%)
-            status_text.text("📊 Pré-traitement des données...")
-            progress_bar.progress(0.15)
-            
-            # Sécurisation automatique des données (anti-dépassement)
-            df_pdf = filtered_df.copy().fillna("").astype(str)
-            max_chars = 800  # Limite fixe pour éviter les erreurs PDF
-            
-            # Fonction de troncature intelligente
-            def safe_truncate(text, max_len):
-                if len(str(text)) <= max_len:
-                    return str(text)
-                return str(text)[:max_len-3] + "..."
-            
-            df_pdf = df_pdf.applymap(lambda s: safe_truncate(s, max_chars))
-            
-            products = df_pdf.to_dict(orient="records")
-            
-            # Étape 2: Génération de la couverture (20%)
-            status_text.text("📄 Génération de la couverture...")
-            progress_bar.progress(0.20)
-            
-            # Étape 3: Génération du PDF avec progression détaillée
-            status_text.text("📦 Génération des pages produits...")
-            progress_bar.progress(0.25)
-            
-            # Génération en mémoire avec qualité sélectionnée et callback de progression détaillée
-            st.session_state.pdf_bytes = safe_generate_pdf(
-                products=products,
-                filename=None,
-                titre=titre,
-                sous_titre=sous_titre,
-                logo_path=logo_path,
-                cover_path=cover_path,
-                quality=selected_quality,
-                products_per_page=produits_par_page,
-                bg_color=bg_color,
-                primary_color=color,
-                output="bytes",
-                progress_callback=update_progress_detailed
-            )
-            
-            # Progression finale après génération
-            progress_bar.progress(0.95)
-            status_text.text("🔧 Finalisation du PDF...")
-            
-            # Chemin temporaire pour l'aperçu (98%)
-            status_text.text("💾 Sauvegarde temporaire...")
+            # Fichier temporaire pour aperçu/téléchargement
             tmp = Path(tempfile.gettempdir()) / st.session_state.pdf_name
             tmp.write_bytes(st.session_state.pdf_bytes)
             st.session_state.pdf_tmp_path = tmp
-            progress_bar.progress(0.98)
             
-            # Étape 4: Finalisation (100%)
-            progress_bar.progress(1.0)
-            status_text.text("✅ PDF généré avec succès !")
+            st.success(f"Catalogue généré: {len(filtered_df)} articles")
             
-            st.success("PDF moderne généré avec succès en Haute Définition (HD) !")
-            
-        except LayoutError as e:
-            st.error(f"❌ Erreur de mise en page : {e}")
-            st.info("💡 Le contenu est trop large pour la page. Essayez de réduire le nombre de colonnes ou de produits par page.")
-            status_text.text("❌ Erreur de mise en page")
         except Exception as e:
-            st.error(f"Erreur lors de la génération du PDF : {e}")
-            status_text.text("❌ Erreur lors de la génération")
+            st.error(f"Erreur de lecture/génération: {e}")
+            st.exception(e)
+    
+    # Outil de debug rapide pour une URL
+    st.markdown("---")
+    st.subheader("🔍 Test d'URL d'image (debug)")
+    test_url = st.text_input("Tester une URL d'image")
+    if test_url:
+        img = load_pil_image_from_url(test_url)
+        if img:
+            st.image(img, caption="Aperçu (PIL)")
+        else:
+            st.error("Téléchargement/lecture échouée pour cette URL.")
+
+else:
+    # Mode standard
+    # Qualité fixée en HD par défaut
+    selected_quality = "hd"
+
+    # Option d'aperçu
+    preview = st.checkbox("Afficher un aperçu (lent)", value=False, disabled=not HAVE_PDF2IMAGE)
+    if not HAVE_PDF2IMAGE and preview:
+        st.info("pdf2image non disponible pour l'aperçu.")
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        if st.button("Générer le PDF catalogue 🚀"):
+            # Barre de progression
+            st.session_state.progress_bar = st.progress(0)
+            st.session_state.status_text = st.empty()
+            progress_bar = st.session_state.progress_bar
+            status_text = st.session_state.status_text
+            
+            try:
+                # Étape 1: Préparation des données (5%)
+                status_text.text("🔄 Préparation des données...")
+                progress_bar.progress(0.05)
+                
+                # Enregistrement des polices système (10%)
+                status_text.text("🔤 Enregistrement des polices...")
+                download_and_register_fonts()
+                progress_bar.progress(0.10)
+                
+                # Conversion des données (15%)
+                status_text.text("📊 Pré-traitement des données...")
+                progress_bar.progress(0.15)
+                
+                # Sécurisation automatique des données (anti-dépassement)
+                df_pdf = filtered_df.copy().fillna("").astype(str)
+                max_chars = 800  # Limite fixe pour éviter les erreurs PDF
+                
+                # Fonction de troncature intelligente
+                def safe_truncate(text, max_len):
+                    if len(str(text)) <= max_len:
+                        return str(text)
+                    return str(text)[:max_len-3] + "..."
+                
+                df_pdf = df_pdf.applymap(lambda s: safe_truncate(s, max_chars))
+                
+                products = df_pdf.to_dict(orient="records")
+                
+                # Étape 2: Génération de la couverture (20%)
+                status_text.text("📄 Génération de la couverture...")
+                progress_bar.progress(0.20)
+                
+                # Étape 3: Génération du PDF avec progression détaillée
+                status_text.text("📦 Génération des pages produits...")
+                progress_bar.progress(0.25)
+                
+                # Génération en mémoire avec qualité sélectionnée et callback de progression détaillée
+                st.session_state.pdf_bytes = safe_generate_pdf(
+                    products=products,
+                    filename=None,
+                    titre=titre,
+                    sous_titre=sous_titre,
+                    logo_path=logo_path,
+                    cover_path=cover_path,
+                    quality=selected_quality,
+                    products_per_page=produits_par_page,
+                    bg_color=bg_color,
+                    primary_color=color,
+                    output="bytes",
+                    progress_callback=update_progress_detailed
+                )
+                
+                # Progression finale après génération
+                progress_bar.progress(0.95)
+                status_text.text("🔧 Finalisation du PDF...")
+                
+                # Chemin temporaire pour l'aperçu (98%)
+                status_text.text("💾 Sauvegarde temporaire...")
+                tmp = Path(tempfile.gettempdir()) / st.session_state.pdf_name
+                tmp.write_bytes(st.session_state.pdf_bytes)
+                st.session_state.pdf_tmp_path = tmp
+                progress_bar.progress(0.98)
+                
+                # Étape 4: Finalisation (100%)
+                progress_bar.progress(1.0)
+                status_text.text("✅ PDF généré avec succès !")
+                
+                st.success("PDF moderne généré avec succès en Haute Définition (HD) !")
+                
+            except LayoutError as e:
+                st.error(f"❌ Erreur de mise en page : {e}")
+                st.info("💡 Le contenu est trop large pour la page. Essayez de réduire le nombre de colonnes ou de produits par page.")
+                status_text.text("❌ Erreur de mise en page")
+            except Exception as e:
+                st.error(f"Erreur lors de la génération du PDF : {e}")
+                status_text.text("❌ Erreur lors de la génération")
 
 with col2:
     # Espace pour équilibrer la mise en page
