@@ -431,38 +431,61 @@ if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
     # Mode images URL
     st.info("📡 Mode images URL activé - Les images seront téléchargées depuis les URLs du CSV")
     
+    # Option d'aperçu pour le mode images URL
+    preview = st.checkbox("Afficher un aperçu (lent)", value=False, disabled=not HAVE_PDF2IMAGE)
+    if not HAVE_PDF2IMAGE and preview:
+        st.info("pdf2image non disponible pour l'aperçu.")
+    
     if st.button("Générer le PDF avec images URL 🚀"):
+        # Barre de progression
+        st.session_state.progress_bar = st.progress(0)
+        st.session_state.status_text = st.empty()
+        progress_bar = st.session_state.progress_bar
+        status_text = st.session_state.status_text
+        
         try:
+            # Étape 1: Préparation des données (10%)
+            status_text.text("🔄 Préparation des données...")
+            progress_bar.progress(0.10)
+            
             # Assurer la présence des colonnes image (certaines peuvent manquer)
             for col in IMG_COLS:
                 if col not in filtered_df.columns:
                     filtered_df[col] = ""
             
+            # Étape 2: Téléchargement des images (50%)
+            status_text.text("📡 Téléchargement des images depuis les URLs...")
+            progress_bar.progress(0.50)
+            
+            # Étape 3: Génération du PDF (80%)
+            status_text.text("📄 Génération du PDF...")
+            progress_bar.progress(0.80)
+            
             pdf_bytes = build_pdf_from_df(filtered_df)
             st.session_state.pdf_bytes = pdf_bytes
             st.session_state.pdf_name = "catalog_images_url.pdf"
+            
+            # Étape 4: Finalisation (95%)
+            status_text.text("💾 Sauvegarde du fichier...")
+            progress_bar.progress(0.95)
             
             # Fichier temporaire pour aperçu/téléchargement
             tmp = Path(tempfile.gettempdir()) / st.session_state.pdf_name
             tmp.write_bytes(st.session_state.pdf_bytes)
             st.session_state.pdf_tmp_path = tmp
             
+            # Étape 5: Terminé (100%)
+            progress_bar.progress(1.0)
+            status_text.text("✅ PDF généré avec succès !")
+            
             st.success(f"Catalogue généré: {len(filtered_df)} articles")
             
         except Exception as e:
             st.error(f"Erreur de lecture/génération: {e}")
             st.exception(e)
+            status_text.text("❌ Erreur lors de la génération")
     
-    # Outil de debug rapide pour une URL
-    st.markdown("---")
-    st.subheader("🔍 Test d'URL d'image (debug)")
-    test_url = st.text_input("Tester une URL d'image")
-    if test_url:
-        img = load_pil_image_from_url(test_url)
-        if img:
-            st.image(img, caption="Aperçu (PIL)")
-        else:
-            st.error("Téléchargement/lecture échouée pour cette URL.")
+
 
 else:
     # Mode standard
