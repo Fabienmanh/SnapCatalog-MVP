@@ -233,13 +233,72 @@ st.set_page_config(page_title="SnapCatalog, votre catalogue en un clin d'oeil", 
 st.title("📒 SnapCatalog — Générateur de PDF produits")
 st.write("Importe ton fichier produits (Shopify, Etsy…), sélectionne tes colonnes, choisis un template et génère ton catalogue au format PDF!")
 
-# Mode de génération
-st.subheader("🔧 Mode de génération")
-generation_mode = st.radio(
-    "Choisissez le mode de génération :",
-    ["Mode standard (avec images locales)", "Mode images URL (pour CSV Etsy avec URLs)"],
-    index=0
-)
+# Détection automatique du type d'images
+def detect_image_type(df):
+    """Détecte automatiquement si les images sont locales ou des URLs"""
+    # Recherche des colonnes d'images avec des patterns plus larges
+    image_columns = []
+    for col in df.columns:
+        col_lower = col.lower()
+        if any(keyword in col_lower for keyword in ['image', 'photo', 'picture', 'img', 'pic']):
+            image_columns.append(col)
+    
+    if not image_columns:
+        return "no_images", "Aucune colonne d'image détectée"
+    
+    # Échantillonner plus de lignes pour une meilleure détection
+    sample_size = min(20, len(df))
+    sample_df = df.head(sample_size)
+    
+    url_count = 0
+    local_count = 0
+    empty_count = 0
+    mixed_cell_count = 0
+    
+    for col in image_columns:
+        for value in sample_df[col].dropna():
+            value_str = str(value).strip()
+            if not value_str or value_str.lower() in ['nan', 'none', 'null', '']:
+                empty_count += 1
+                continue
+                
+            # Détection d'URLs (plus robuste)
+            if (value_str.startswith(('http://', 'https://')) or 
+                value_str.startswith(('data:image/', 'blob:')) or
+                '://' in value_str or
+                re.search(r'https?://[^\s]+', value_str)):
+                url_count += 1
+            # Détection de chemins locaux
+            elif (value_str.startswith(('./', '../', '/', 'C:', 'D:', 'E:')) or
+                  value_str.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp')) or
+                  '\\' in value_str or '/' in value_str):
+                local_count += 1
+            # Cellules contenant plusieurs URLs (cas Etsy)
+            elif re.search(r'https?://[^\s]+', value_str):
+                url_count += 1
+                mixed_cell_count += 1
+            else:
+                # Par défaut, considérer comme local
+                local_count += 1
+    
+    total_samples = url_count + local_count + empty_count
+    
+    if total_samples == 0:
+        return "no_images", "Aucune image trouvée dans l'échantillon"
+    
+    url_percentage = (url_count / total_samples) * 100
+    local_percentage = (local_count / total_samples) * 100
+    
+    # Seuil plus bas pour la détection automatique
+    if url_percentage > 60:
+        return "url", f"Images URL détectées ({url_percentage:.1f}% d'URLs)"
+    elif local_percentage > 60:
+        return "local", f"Images locales détectées ({local_percentage:.1f}% de chemins locaux)"
+    else:
+        return "mixed", f"Images mixtes détectées (URLs: {url_percentage:.1f}%, Locales: {local_percentage:.1f}%)"
+
+# Mode par défaut
+generation_mode = "Mode standard (avec images locales)"
 
 # NOUVEAU : Section de personnalisation (placée tôt pour qu'elle s'affiche toujours)
 st.subheader("🎨 Personnalisation du PDF")
@@ -263,6 +322,69 @@ if uploaded_file is not None:
     df, csv_type = UploadHandler.validate_csv_file(uploaded_file)
     
     if df is not None and csv_type:
+        # Détection automatique du type d'images
+        image_type, detection_message = detect_image_type(df)
+        
+        st.subheader("🔍 Détection automatique des images")
+        st.info(f"📊 {detection_message}")
+        
+        # Affichage détaillé de la détection
+        with st.expander("🔍 Détails de la détection"):
+            st.write("**Colonnes d'images détectées :**")
+            image_columns = [col for col in df.columns if any(keyword in col.lower() for keyword in ['image', 'photo', 'picture', 'img', 'pic'])]
+            if image_columns:
+                for col in image_columns:
+                    st.write(f"- {col}")
+            else:
+                st.write("Aucune colonne d'image détectée")
+            
+            st.write("**Échantillon des données :**")
+            if image_columns:
+                sample_df = df[image_columns].head(5)
+                st.dataframe(sample_df, use_container_width=True)
+            else:
+                st.write("Aucune donnée d'image à afficher")
+        
+        # Option pour forcer le mode manuellement (masquée pour l'instant)
+        # force_manual = st.checkbox("🔧 Forcer le choix manuel du mode", value=False)
+        force_manual = False  # Désactivé temporairement
+        
+        if force_manual:
+            st.warning("⚠️ Mode manuel activé - Vous pouvez choisir le mode indépendamment de la détection")
+            generation_mode = st.radio(
+                "Choisissez le mode de génération :",
+                ["Mode standard (avec images locales)", "Mode images URL (pour CSV Etsy avec URLs)"],
+                index=0
+            )
+        else:
+            # Détection automatique
+            if image_type == "url":
+                generation_mode = "Mode images URL (pour CSV Etsy avec URLs)"
+                st.success("✅ Mode images URL sélectionné automatiquement")
+            elif image_type == "local":
+                generation_mode = "Mode standard (avec images locales)"
+                st.success("✅ Mode standard sélectionné automatiquement")
+            elif image_type == "mixed":
+                st.warning("⚠️ Images mixtes détectées - Mode standard sélectionné par défaut")
+                generation_mode = "Mode standard (avec images locales)"
+                # generation_mode = st.radio(
+                #     "Choisissez le mode de génération :",
+                #     ["Mode standard (avec images locales)", "Mode images URL (pour CSV Etsy avec URLs)"],
+                #     index=0
+                # )
+            else:
+                generation_mode = "Mode standard (avec images locales)"
+                st.info("ℹ️ Mode standard par défaut (aucune image détectée)")
+        
+        # Affichage du mode sélectionné
+        st.markdown("---")
+        if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
+            st.success("🎯 **Mode sélectionné : Images URL** - Les images seront téléchargées depuis les URLs du CSV")
+            st.info("💡 **Conseil :** Ce mode est idéal pour les exports Etsy, Shopify ou autres plateformes e-commerce qui contiennent des URLs d'images.")
+        else:
+            st.info("🎯 **Mode sélectionné : Standard** - Utilisation des images locales")
+            st.info("💡 **Conseil :** Ce mode est idéal pour les fichiers CSV avec des chemins d'images locaux ou des noms de fichiers.")
+        
         # --- Détection automatique des colonnes "utiles" ---
         auto_columns = []
         for name in ["title", "titre", "description", "desc", "price", "prix", "image 1", "image", "photo", "sku", "référence", "ref", "code devise", "devise", "quantité", "quantite", "qte", "matériaux", "materiaux", "material"]:
