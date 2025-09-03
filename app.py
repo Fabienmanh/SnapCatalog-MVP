@@ -322,13 +322,9 @@ if uploaded_file is not None:
     df, csv_type = UploadHandler.validate_csv_file(uploaded_file)
     
     if df is not None and csv_type:
-        # Détection automatique du type d'images
+        # Détection automatique du type d'images (silencieuse)
         image_type, detection_message = detect_image_type(df)
         
-        st.subheader("🔍 Détection automatique des images")
-        st.info(f"📊 {detection_message}")
-        
-
         # Option pour forcer le mode manuellement (masquée pour l'instant)
         # force_manual = st.checkbox("🔧 Forcer le choix manuel du mode", value=False)
         force_manual = False  # Désactivé temporairement
@@ -341,33 +337,15 @@ if uploaded_file is not None:
                 index=0
             )
         else:
-            # Détection automatique
+            # Détection automatique silencieuse
             if image_type == "url":
                 generation_mode = "Mode images URL (pour CSV Etsy avec URLs)"
-                st.success("✅ Mode images URL sélectionné automatiquement")
             elif image_type == "local":
                 generation_mode = "Mode standard (avec images locales)"
-                st.success("✅ Mode standard sélectionné automatiquement")
             elif image_type == "mixed":
-                st.warning("⚠️ Images mixtes détectées - Mode standard sélectionné par défaut")
                 generation_mode = "Mode standard (avec images locales)"
-                # generation_mode = st.radio(
-                #     "Choisissez le mode de génération :",
-                #     ["Mode standard (avec images locales)", "Mode images URL (pour CSV Etsy avec URLs)"],
-                #     index=0
-                # )
             else:
                 generation_mode = "Mode standard (avec images locales)"
-                st.info("ℹ️ Mode standard par défaut (aucune image détectée)")
-        
-        # Affichage du mode sélectionné
-        st.markdown("---")
-        if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
-            st.success("🎯 **Mode sélectionné : Images URL** - Les images seront téléchargées depuis les URLs du CSV")
-            st.info("💡 **Conseil :** Ce mode est idéal pour les exports Etsy, Shopify ou autres plateformes e-commerce qui contiennent des URLs d'images.")
-        else:
-            st.info("🎯 **Mode sélectionné : Standard** - Utilisation des images locales")
-            st.info("💡 **Conseil :** Ce mode est idéal pour les fichiers CSV avec des chemins d'images locaux ou des noms de fichiers.")
         
         # --- Détection automatique des colonnes "utiles" ---
         auto_columns = []
