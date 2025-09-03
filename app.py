@@ -328,23 +328,7 @@ if uploaded_file is not None:
         st.subheader("🔍 Détection automatique des images")
         st.info(f"📊 {detection_message}")
         
-        # Affichage détaillé de la détection
-        with st.expander("🔍 Détails de la détection"):
-            st.write("**Colonnes d'images détectées :**")
-            image_columns = [col for col in df.columns if any(keyword in col.lower() for keyword in ['image', 'photo', 'picture', 'img', 'pic'])]
-            if image_columns:
-                for col in image_columns:
-                    st.write(f"- {col}")
-            else:
-                st.write("Aucune colonne d'image détectée")
-            
-            st.write("**Échantillon des données :**")
-            if image_columns:
-                sample_df = df[image_columns].head(5)
-                st.dataframe(sample_df, use_container_width=True)
-            else:
-                st.write("Aucune donnée d'image à afficher")
-        
+
         # Option pour forcer le mode manuellement (masquée pour l'instant)
         # force_manual = st.checkbox("🔧 Forcer le choix manuel du mode", value=False)
         force_manual = False  # Désactivé temporairement
