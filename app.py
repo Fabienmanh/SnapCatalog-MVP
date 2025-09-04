@@ -2,10 +2,14 @@ import io, re, requests, os, tempfile
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -31,6 +35,87 @@ try:
 except Exception:
     HAVE_PDF2IMAGE = False
 
+# ----- HTTP + CSV Etsy utils -----
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+IMG_COL_RE = re.compile(r"^\s*IMAGE\s*\d+\s*$", re.I)
+URL_RE = re.compile(r"^https?://[^\s\"']+$")
+
+def http_session():
+    s = requests.Session()
+    r = Retry(total=3, backoff_factor=0.7, status_forcelist=[429,500,502,503,504])
+    s.mount("http://", HTTPAdapter(max_retries=r))
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.headers.update({"User-Agent": "SnapCatalog/1.0"})
+    return s
+
+def fetch_csv_bytes(url, timeout=12, max_bytes=15_000_000):
+    with http_session().get(url, timeout=timeout, stream=True, allow_redirects=True) as r:
+        r.raise_for_status()
+        buf = io.BytesIO()
+        total = 0
+        for chunk in r.iter_content(1024*32):
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"CSV trop volumineux (> {max_bytes/1_000_000:.1f} Mo)")
+            buf.write(chunk)
+        buf.seek(0)
+        return buf
+
+def read_etsy_csv(url):
+    raw = fetch_csv_bytes(url)
+    # Essai 1: UTF‑8 strict
+    try:
+        df = pd.read_csv(
+            raw,
+            sep=",", quotechar='"', engine="python",
+            on_bad_lines="skip",
+        )
+    except UnicodeDecodeError:
+        # Essai 2: CP1252
+        raw.seek(0)
+        df = pd.read_csv(
+            raw,
+            sep=",", quotechar='"', engine="python",
+            encoding="cp1252",
+            on_bad_lines="skip",
+        )
+    # Normalisation des noms de colonnes
+    df.columns = [c.strip().upper() for c in df.columns]
+    # Renommer quelques colonnes françaises fréquentes
+    df = df.rename(columns={
+        "TITRE": "TITLE",
+        "DESCRIPTION": "DESCRIPTION",
+        "PRIX": "PRICE",
+        "CODE_DEVISE": "CURRENCY_CODE",
+        "QUANTITÉ": "QUANTITY",
+        "RÉFÉRENCE": "SKU",
+    })
+    # Collecte des colonnes image (IMAGE 1..10)
+    img_cols = [c for c in df.columns if IMG_COL_RE.match(c)]
+
+    def extract_urls(row):
+        urls = []
+        for c in img_cols:
+            val = str(row.get(c, "")).strip()
+            if val and URL_RE.match(val):
+                urls.append(val)
+        return urls
+
+    df["IMAGE_URLS"] = df.apply(extract_urls, axis=1)
+    df = df[df["IMAGE_URLS"].map(len) > 0].reset_index(drop=True)
+    return df
+
+# Exécuter une fonction avec délai maximum
+def run_with_timeout(fn, timeout, *args, **kwargs):
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn, *args, **kwargs)
+        return fut.result(timeout=timeout)
+
+# Fonction de génération sécurisée avec wrapper direct
 def safe_generate_pdf(products, filename, titre, sous_titre, logo_path, cover_path,
                       quality, products_per_page, bg_color, primary_color,
                       output="bytes", progress_callback=None):
@@ -236,12 +321,39 @@ if was_adjusted:
 bg_color = validated_color
 
 # 1. Import du fichier CSV de produits
+# Option A: via URL Etsy (lien direct)
+st.markdown("---")
+st.subheader("🔗 Import via URL Etsy (optionnel)")
+csv_url = st.text_input("URL du CSV Etsy (lien direct)")
+if st.button("Charger et analyser") and csv_url:
+    with st.status("Lecture du CSV…", expanded=True) as status:
+        try:
+            st.write("Téléchargement + sécurité (taille/timeout)…")
+            df_url = run_with_timeout(read_etsy_csv, 30, csv_url)
+            st.session_state.df_from_url = df_url
+            st.write(f"Lignes valides: {len(df_url)}")
+            st.dataframe(df_url[["TITLE","PRICE","CURRENCY_CODE","IMAGE_URLS"]].head(5))
+            status.update(label="CSV chargé", state="complete")
+        except TimeoutError:
+            st.error("Timeout pendant la lecture du CSV (30s). Vérifie l’URL (lien direct) ou réessaie.")
+            status.update(label="Timeout", state="error")
+        except Exception as e:
+            st.error(f"Erreur de lecture CSV: {e}")
+            status.update(label="Erreur", state="error")
+
+# Option B: téléversement classique
 uploaded_file = UploadHandler.handle_file_upload()
 
+# Résolution de la source de données
+df = None
+csv_type = None
 if uploaded_file is not None:
     df, csv_type = UploadHandler.validate_csv_file(uploaded_file)
-    
-    if df is not None and csv_type:
+elif "df_from_url" in st.session_state and st.session_state.df_from_url is not None:
+    df = st.session_state.df_from_url
+    csv_type = "etsy_url"
+
+if df is not None and csv_type:
         # Détection automatique du type d'images (silencieuse)
         image_type, detection_message = detect_image_type(df)
         
@@ -343,6 +455,7 @@ if uploaded_file is not None:
         sous_titre = st.text_input("Sous-titre :", "Tous nos produits en un coup d'œil")
 
 else:
+    st.info("Téléverse un CSV ou colle une URL Etsy puis clique sur Charger et analyser.")
     st.stop()
 
 # --- GÉNÉRATION DU PDF ---
