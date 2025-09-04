@@ -325,8 +325,8 @@ uploaded_file = UploadHandler.handle_file_upload()
 
 if uploaded_file is not None:
     df, csv_type = UploadHandler.validate_csv_file(uploaded_file)
-
-if df is not None and csv_type:
+    
+    if df is not None and csv_type:
         # Détection automatique du type d'images (silencieuse)
         image_type, detection_message = detect_image_type(df)
         
