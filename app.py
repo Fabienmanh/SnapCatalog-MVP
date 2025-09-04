@@ -321,37 +321,10 @@ if was_adjusted:
 bg_color = validated_color
 
 # 1. Import du fichier CSV de produits
-# Option A: via URL Etsy (lien direct)
-st.markdown("---")
-st.subheader("🔗 Import via URL Etsy (optionnel)")
-csv_url = st.text_input("URL du CSV Etsy (lien direct)")
-if st.button("Charger et analyser") and csv_url:
-    with st.status("Lecture du CSV…", expanded=True) as status:
-        try:
-            st.write("Téléchargement + sécurité (taille/timeout)…")
-            df_url = run_with_timeout(read_etsy_csv, 30, csv_url)
-            st.session_state.df_from_url = df_url
-            st.write(f"Lignes valides: {len(df_url)}")
-            st.dataframe(df_url[["TITLE","PRICE","CURRENCY_CODE","IMAGE_URLS"]].head(5))
-            status.update(label="CSV chargé", state="complete")
-        except TimeoutError:
-            st.error("Timeout pendant la lecture du CSV (30s). Vérifie l’URL (lien direct) ou réessaie.")
-            status.update(label="Timeout", state="error")
-        except Exception as e:
-            st.error(f"Erreur de lecture CSV: {e}")
-            status.update(label="Erreur", state="error")
-
-# Option B: téléversement classique
 uploaded_file = UploadHandler.handle_file_upload()
 
-# Résolution de la source de données
-df = None
-csv_type = None
 if uploaded_file is not None:
     df, csv_type = UploadHandler.validate_csv_file(uploaded_file)
-elif "df_from_url" in st.session_state and st.session_state.df_from_url is not None:
-    df = st.session_state.df_from_url
-    csv_type = "etsy_url"
 
 if df is not None and csv_type:
         # Détection automatique du type d'images (silencieuse)
@@ -455,7 +428,6 @@ if df is not None and csv_type:
         sous_titre = st.text_input("Sous-titre :", "Tous nos produits en un coup d'œil")
 
 else:
-    st.info("Téléverse un CSV ou colle une URL Etsy puis clique sur Charger et analyser.")
     st.stop()
 
 # --- GÉNÉRATION DU PDF ---
