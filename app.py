@@ -1,15 +1,16 @@
-import io, re, requests, os, tempfile
+import io, re, requests, os, tempfile, time, random, logging
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
-import logging
+from collections import defaultdict
+from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -39,16 +40,94 @@ except Exception:
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-IMG_COL_RE = re.compile(r"^\s*IMAGE\s*\d+\s*$", re.I)
-URL_RE = re.compile(r"^https?://[^\s\"']+$")
+class HostRateLimiter:
+    def __init__(self, rate_per_sec=2, burst=2):
+        self.allowance = defaultdict(lambda: burst)
+        self.last_check = defaultdict(lambda: time.time())
+        self.rate = rate_per_sec
+        self.burst = burst
+
+    def wait(self, host):
+        now = time.time()
+        elapsed = now - self.last_check[host]
+        self.last_check[host] = now
+        self.allowance[host] = min(self.burst, self.allowance[host] + elapsed * self.rate)
+        if self.allowance[host] < 1.0:
+            # attendre le temps nécessaire + un petit jitter
+            need = (1.0 - self.allowance[host]) / self.rate
+            time.sleep(need + random.uniform(0, 0.15))
+            self.allowance[host] = 0
+        else:
+            self.allowance[host] -= 1.0
 
 def http_session():
     s = requests.Session()
-    r = Retry(total=3, backoff_factor=0.7, status_forcelist=[429,500,502,503,504])
+    r = Retry(
+        total=2, backoff_factor=0.8,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET", "HEAD"]
+    )
     s.mount("http://", HTTPAdapter(max_retries=r))
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "SnapCatalog/1.0"})
+    s.headers.update({"User-Agent": "SnapCatalog/1.0 (+contact@example.com)"})
     return s
+
+rate = HostRateLimiter(rate_per_sec=1.0, burst=1)  # 1 req/s par hôte
+
+def fetch_image_politely(url, timeout=8, max_bytes=2_000_000):
+    host = urlparse(url).netloc
+    rate.wait(host)
+    s = http_session()
+    # Si vous avez déjà un ETag/Last-Modified en cache, ajoutez If-None-Match / If-Modified-Since ici
+    with s.get(url, timeout=timeout, stream=True, allow_redirects=True) as r:
+        if r.status_code in (403, 429):
+            # Backoff manuel plus long + message clair
+            wait = int(r.headers.get("Retry-After", "4"))
+            time.sleep(wait + random.uniform(0, 0.5))
+            raise RuntimeError(f"Accès bloqué par l'hôte ({r.status_code}). Réduisez la cadence ou utilisez des copies locales.")
+        r.raise_for_status()
+        buf, total = io.BytesIO(), 0
+        for chunk in r.iter_content(32_768):
+            if not chunk: break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("Image trop volumineuse")
+            buf.write(chunk)
+        return buf.getvalue()
+
+class Circuit:
+    def __init__(self, threshold=5, cooldown=600):
+        self.errors = defaultdict(int)
+        self.block_until = defaultdict(float)
+        self.threshold = threshold
+        self.cooldown = cooldown
+
+    def check(self, host):
+        if time.time() < self.block_until[host]:
+            raise RuntimeError(f"Hôte {host} en cooldown, réessayez plus tard.")
+    def record(self, host, ok):
+        if ok:
+            self.errors[host] = 0
+        else:
+            self.errors[host] += 1
+            if self.errors[host] >= self.threshold:
+                self.block_until[host] = time.time() + self.cooldown
+
+circuit = Circuit()
+
+def safe_fetch(url):
+    host = urlparse(url).netloc
+    circuit.check(host)
+    try:
+        data = fetch_image_politely(url)
+        circuit.record(host, True)
+        return data
+    except Exception:
+        circuit.record(host, False)
+        raise
+
+IMG_COL_RE = re.compile(r"^\s*IMAGE\s*\d+\s*$", re.I)
+URL_RE = re.compile(r"^https?://[^\s\"']+$")
 
 def fetch_csv_bytes(url, timeout=12, max_bytes=15_000_000):
     with http_session().get(url, timeout=timeout, stream=True, allow_redirects=True) as r:
