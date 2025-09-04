@@ -17,6 +17,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus.doctemplate import LayoutError
 
+# Import pour compression PDF
+try:
+    from pypdf2 import PdfReader, PdfWriter
+    HAVE_PYPDF2 = True
+except ImportError:
+    try:
+        from PyPDF2 import PdfReader, PdfWriter
+        HAVE_PYPDF2 = True
+    except ImportError:
+        HAVE_PYPDF2 = False
+
 # Utils
 from utils.font_manager import download_and_register_fonts, validate_background_color
 from utils.helpers import update_progress_detailed
@@ -154,6 +165,40 @@ def safe_fetch(url):
     except Exception:
         circuit.record(host, False)
         raise
+
+def compress_pdf(pdf_bytes):
+    """Compresse un PDF en utilisant PyPDF2"""
+    if not HAVE_PYPDF2:
+        log.warning("PyPDF2 non disponible, compression ignorée")
+        return pdf_bytes
+    
+    try:
+        log.info("Début compression PDF")
+        reader = PdfReader(BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        
+        for page in reader.pages:
+            writer.add_page(page)
+        
+        # Préserver les métadonnées si elles existent
+        if reader.metadata:
+            writer.add_metadata(reader.metadata)
+        
+        output = BytesIO()
+        writer.write(output)
+        output.seek(0)
+        
+        compressed_bytes = output.getvalue()
+        original_size = len(pdf_bytes)
+        compressed_size = len(compressed_bytes)
+        compression_ratio = (1 - compressed_size / original_size) * 100
+        
+        log.info(f"PDF compressé: {original_size/1024/1024:.2f}MB -> {compressed_size/1024/1024:.2f}MB ({compression_ratio:.1f}% de réduction)")
+        
+        return compressed_bytes
+    except Exception as e:
+        log.warning(f"Erreur compression PDF: {e}, retour du PDF original")
+        return pdf_bytes
 
 IMG_COL_RE = re.compile(r"^\s*IMAGE\s*\d+\s*$", re.I)
 URL_RE = re.compile(r"^https?://[^\s\"']+$")
@@ -622,6 +667,10 @@ if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
             # Utiliser le callback de progression dans build_pdf_from_df
             pdf_bytes = build_pdf_from_df(filtered_df, progress_callback=update_progress)
             
+            # Compression du PDF
+            update_progress(0.90, "🗜️ Compression du PDF...")
+            pdf_bytes = compress_pdf(pdf_bytes)
+            
             st.session_state.pdf_bytes = pdf_bytes
             st.session_state.pdf_name = "catalog_images_url.pdf"
 
@@ -690,7 +739,7 @@ else:
                 
                 update_progress(0.25, "📦 Génération des pages produits...")
                 
-                st.session_state.pdf_bytes = safe_generate_pdf(
+                pdf_bytes = safe_generate_pdf(
                     products=products,
                     filename=None,
                     titre=titre,
@@ -704,6 +753,11 @@ else:
                     output="bytes",
                     progress_callback=update_progress_detailed
                 )
+                
+                # Compression du PDF
+                update_progress(0.90, "🗜️ Compression du PDF...")
+                pdf_bytes = compress_pdf(pdf_bytes)
+                st.session_state.pdf_bytes = pdf_bytes
                 
                 update_progress(0.95, "🔧 Finalisation du PDF...")
                 
@@ -755,8 +809,59 @@ if preview and st.session_state.pdf_tmp_path and st.session_state.pdf_tmp_path.e
         st.warning(f"⚠️ Aperçu indisponible: {e}")
         st.info("💡 L'aperçu nécessite l'installation de poppler-utils.")
 
-# Section Feedback (optionnelle)
-if st.session_state.pdf_bytes:
+# Section Debug et Téléchargement
+if 'pdf_bytes' in st.session_state and st.session_state.pdf_bytes:
+    st.markdown("---")
+    st.subheader("💾 Télécharger votre catalogue")
+    
+    # Debug : Affiche taille et preview
+    pdf_size_mb = len(st.session_state.pdf_bytes) / 1024 / 1024
+    st.write(f"PDF généré avec succès ! Taille : {pdf_size_mb:.2f} MB")
+    
+    # Afficher le statut de compression si PyPDF2 est disponible
+    if HAVE_PYPDF2:
+        st.info("✅ PDF compressé automatiquement pour réduire la taille")
+    else:
+        st.warning("⚠️ PyPDF2 non installé - compression non disponible")
+    
+    # Option 1 : Download direct (avec try-except)
+    try:
+        st.download_button(
+            label="📥 Télécharger PDF",
+            data=st.session_state.pdf_bytes,
+            file_name=st.session_state.pdf_name or "catalogue.pdf",
+            mime="application/pdf",
+            key="download_pdf_button"  # Key unique pour forcer refresh
+        )
+    except Exception as e:
+        st.error(f"Erreur lors du download : {e}. Essayez de rafraîchir la page.")
+    
+    # Option 2 : Sauvegarde temporaire sur disque (plus robuste pour gros fichiers)
+    temp_pdf_path = "temp_catalogue.pdf"
+    with open(temp_pdf_path, "wb") as f:
+        f.write(st.session_state.pdf_bytes)
+    with open(temp_pdf_path, "rb") as f:
+        st.download_button(
+            label="📥 Télécharger PDF (via fichier temp)",
+            data=f,
+            file_name="catalogue.pdf",
+            mime="application/pdf",
+            key="download_temp_button"
+        )
+    # Nettoyage (optionnel)
+    if os.path.exists(temp_pdf_path):
+        os.remove(temp_pdf_path)
+
+    # Aperçu (si tu as pdf2image installé)
+    if st.checkbox("Afficher aperçu (première page)"):
+        try:
+            from pdf2image import convert_from_bytes
+            images = convert_from_bytes(st.session_state.pdf_bytes)
+            st.image(images[0], caption="Aperçu PDF", use_column_width=True)
+        except Exception as e:
+            st.warning(f"Aperçu indisponible: {e}")
+
+    # Section Feedback (optionnelle)
     st.markdown("---")
     st.subheader("📝 Feedback obligatoire")
     st.write("**Pour télécharger votre PDF, vous devez d'abord nous donner votre avis :**")
@@ -799,17 +904,15 @@ if st.session_state.pdf_bytes:
     # Bouton de téléchargement - seulement si le feedback a été soumis
     if st.session_state.feedback_submitted:
         st.success("🎉 Merci pour votre retour !")
-        st.markdown("---")
-        st.subheader("💾 Télécharger votre catalogue")
-        st.download_button(
-            label="📥 Télécharger le PDF catalogue",
-            data=st.session_state.pdf_bytes,
-            file_name=st.session_state.pdf_name,
-            mime="application/pdf",
-            help="Cliquez pour télécharger votre catalogue personnalisé !"
-        )
     else:
         st.warning("⚠️ Vous devez d'abord soumettre votre avis pour télécharger le PDF.")
         st.info("Veuillez remplir le formulaire de feedback ci-dessus.")
+
+    # Ajout : Bouton pour reset session si bug
+    if st.button("🔄 Reset session (si download bloqué)"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.experimental_rerun()
+
 else:
     st.warning("Aucun PDF n'a encore été généré. Cliquez d'abord sur 'Générer le PDF catalogue 🚀'.")
