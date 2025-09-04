@@ -38,7 +38,22 @@ except Exception:
 
 # ----- HTTP + CSV Etsy utils -----
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# Configuration de logging pour Streamlit Cloud
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+    ]
+)
+
+# Configuration spécifique pour Streamlit Cloud
+if os.getenv("STREAMLIT_CLOUD"):
+    # Désactiver les logs de debug en production
+    logging.getLogger().setLevel(logging.WARNING)
+    # Limiter la taille des fichiers temporaires
+    os.environ["TMPDIR"] = "/tmp"
 
 class HostRateLimiter:
     def __init__(self, rate_per_sec=2, burst=2):
@@ -95,6 +110,20 @@ def fetch_image_politely(url, timeout=8, max_bytes=2_000_000):
             buf.write(chunk)
         return buf.getvalue()
 
+# Configuration des timeouts pour Streamlit Cloud
+if os.getenv("STREAMLIT_CLOUD"):
+    # Timeouts plus courts pour éviter les timeouts de Streamlit
+    IMAGE_TIMEOUT = 5
+    MAX_IMAGE_SIZE = 1_000_000  # 1MB max
+    RATE_LIMIT = 0.5  # Plus lent pour éviter les blocages
+else:
+    IMAGE_TIMEOUT = 8
+    MAX_IMAGE_SIZE = 2_000_000  # 2MB max
+    RATE_LIMIT = 1.0
+
+# Mise à jour des paramètres
+rate = HostRateLimiter(rate_per_sec=RATE_LIMIT, burst=1)
+
 class Circuit:
     def __init__(self, threshold=5, cooldown=600):
         self.errors = defaultdict(int)
@@ -119,7 +148,7 @@ def safe_fetch(url):
     host = urlparse(url).netloc
     circuit.check(host)
     try:
-        data = fetch_image_politely(url)
+        data = fetch_image_politely(url, timeout=IMAGE_TIMEOUT, max_bytes=MAX_IMAGE_SIZE)
         circuit.record(host, True)
         return data
     except Exception:
@@ -234,13 +263,12 @@ def fetch_image_bytes(url: str) -> bytes | None:
     if not url:
         return None
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-        ct = r.headers.get("Content-Type", "")
-        if "image" not in ct and not re.search(r"\.(png|jpe?g|webp|gif|bmp|tiff)$", url, re.I):
-            return None
-        return r.content
-    except Exception:
+        log.info(f"Téléchargement image: {url[:50]}...")
+        data = safe_fetch(url)
+        log.info(f"Image téléchargée avec succès: {len(data)} bytes")
+        return data
+    except Exception as e:
+        log.warning(f"Échec téléchargement image {url[:50]}: {e}")
         return None
 
 def load_pil_image_from_url(url: str) -> Image.Image | None:
@@ -286,14 +314,23 @@ def draw_image_keep_aspect(c, pil_img, x, y, max_w, max_h):
     c.drawImage(ImageReader(pil_img), x, y, width=nw, height=nh, preserveAspectRatio=True, mask='auto')
     return nw, nh
 
-def build_pdf_from_df(df: pd.DataFrame) -> bytes:
+def build_pdf_from_df(df: pd.DataFrame, progress_callback=None) -> bytes:
+    log.info(f"Début génération PDF pour {len(df)} produits")
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     y = PAGE_H - MARGIN
     max_img_w = PAGE_W - 2 * MARGIN
     max_img_h = 260
+    
+    total_products = len(df)
+    processed = 0
 
-    for _, row in df.iterrows():
+    for idx, (_, row) in enumerate(df.iterrows()):
+        if progress_callback:
+            progress = (idx + 1) / total_products
+            progress_callback(progress, f"Traitement produit {idx + 1}/{total_products}")
+        
+        log.info(f"Traitement produit {idx + 1}/{total_products}")
         title = (str(row.get(TITLE_COL, "") or "").strip()) or "Sans titre"
         desc  = str(row.get(DESC_COL, "") or "").strip()
         price = str(row.get(PRICE_COL, "") or "").strip()
@@ -312,19 +349,32 @@ def build_pdf_from_df(df: pd.DataFrame) -> bytes:
         top_y = y
 
         for idx, url in enumerate(urls):
-            pil_img = load_pil_image_from_url(url)
-            r = idx // cols
-            cidx = idx % cols
-            cx = MARGIN + cidx * (cell_w + 12)
-            cy = top_y - (r + 1) * (cell_h + 12)
-            if pil_img:
-                draw_image_keep_aspect(c, pil_img, cx + 6, cy + 6, cell_w - 12, cell_h - 12)
-            else:
-                c.setFillColorRGB(0.92, 0.92, 0.92)
+            try:
+                pil_img = load_pil_image_from_url(url)
+                r = idx // cols
+                cidx = idx % cols
+                cx = MARGIN + cidx * (cell_w + 12)
+                cy = top_y - (r + 1) * (cell_h + 12)
+                if pil_img:
+                    draw_image_keep_aspect(c, pil_img, cx + 6, cy + 6, cell_w - 12, cell_h - 12)
+                else:
+                    c.setFillColorRGB(0.92, 0.92, 0.92)
+                    c.rect(cx, cy, cell_w, cell_h, fill=1, stroke=0)
+                    c.setFillColorRGB(0, 0, 0)
+                    c.setFont("Helvetica", 9)
+                    c.drawString(cx + 8, cy + 8, "Image indisponible")
+            except Exception as e:
+                log.warning(f"Erreur traitement image {url}: {e}")
+                # Dessiner un placeholder d'erreur
+                r = idx // cols
+                cidx = idx % cols
+                cx = MARGIN + cidx * (cell_w + 12)
+                cy = top_y - (r + 1) * (cell_h + 12)
+                c.setFillColorRGB(0.95, 0.8, 0.8)
                 c.rect(cx, cy, cell_w, cell_h, fill=1, stroke=0)
-                c.setFillColorRGB(0, 0, 0)
-                c.setFont("Helvetica", 9)
-                c.drawString(cx + 8, cy + 8, "Image indisponible")
+                c.setFillColorRGB(0.8, 0, 0)
+                c.setFont("Helvetica", 8)
+                c.drawString(cx + 4, cy + 4, "Erreur image")
 
         if not urls:
             cy = top_y - cell_h
@@ -360,9 +410,21 @@ def build_pdf_from_df(df: pd.DataFrame) -> bytes:
 
     c.save()
     buf.seek(0)
-    return buf.read()
+    result = buf.read()
+    log.info(f"PDF généré avec succès: {len(result)} bytes")
+    return result
 
-st.set_page_config(page_title="SnapCatalog, votre catalogue en un clin d'œil", layout="wide")
+# Configuration de la page Streamlit
+st.set_page_config(
+    page_title="SnapCatalog, votre catalogue en un clin d'œil", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Configuration pour éviter les timeouts sur Streamlit Cloud
+if os.getenv("STREAMLIT_CLOUD"):
+    st.set_option('deprecation.showPyplotGlobalUse', False)
+    st.set_option('deprecation.showfileUploaderEncoding', False)
 
 # État initial pour éviter la double génération
 if "pdf_bytes" not in st.session_state:
@@ -457,6 +519,21 @@ if uploaded_file is not None:
         
         # Affichage du nombre total de produits
         total_products = len(filtered_df)
+        
+        # Limite pour les tests en mode développement
+        max_products = st.number_input(
+            "Limite de produits pour les tests (0 = tous)", 
+            min_value=0, 
+            max_value=total_products, 
+            value=min(50, total_products) if total_products > 50 else 0,
+            help="Limitez le nombre de produits pour accélérer les tests"
+        )
+        
+        if max_products > 0:
+            filtered_df = filtered_df.head(max_products)
+            total_products = len(filtered_df)
+            st.warning(f"⚠️ Mode test: seulement {total_products} produits seront traités")
+        
         st.info(f"📊 **{total_products} produits** seront traités pour la génération du PDF")
 
         # 4. Choix ressources graphiques et paramètres
@@ -522,41 +599,44 @@ if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
         st.info("pdf2image non disponible pour l'aperçu.")
     
     if st.button("Générer le PDF avec images URL 🚀"):
+        log.info("Début génération PDF mode images URL")
         st.session_state.progress_bar = st.progress(0)
         st.session_state.status_text = st.empty()
         progress_bar = st.session_state.progress_bar
         status_text = st.session_state.status_text
 
         try:
-            status_text.text("🔄 Préparation des données...")
-            progress_bar.progress(0.10)
+            def update_progress(progress, message):
+                progress_bar.progress(progress)
+                status_text.text(message)
+                log.info(f"Progression: {progress:.1%} - {message}")
 
+            update_progress(0.05, "🔄 Préparation des données...")
+            
             for col in IMG_COLS:
                 if col not in filtered_df.columns:
                     filtered_df[col] = ""
 
-            status_text.text("📡 Téléchargement des images depuis les URLs...")
-            progress_bar.progress(0.50)
-
-            status_text.text("📄 Génération du PDF...")
-            progress_bar.progress(0.80)
-
-            pdf_bytes = build_pdf_from_df(filtered_df)
+            update_progress(0.10, "📡 Début téléchargement des images...")
+            
+            # Utiliser le callback de progression dans build_pdf_from_df
+            pdf_bytes = build_pdf_from_df(filtered_df, progress_callback=update_progress)
+            
             st.session_state.pdf_bytes = pdf_bytes
             st.session_state.pdf_name = "catalog_images_url.pdf"
 
-            status_text.text("💾 Sauvegarde du fichier...")
-            progress_bar.progress(0.95)
+            update_progress(0.95, "💾 Sauvegarde du fichier...")
 
             tmp = Path(tempfile.gettempdir()) / st.session_state.pdf_name
             tmp.write_bytes(st.session_state.pdf_bytes)
             st.session_state.pdf_tmp_path = tmp
 
-            progress_bar.progress(1.0)
-            status_text.text("✅ PDF généré avec succès !")
+            update_progress(1.0, "✅ PDF généré avec succès !")
             st.success(f"Catalogue généré: {len(filtered_df)} articles")
+            log.info(f"PDF généré avec succès: {len(pdf_bytes)} bytes")
 
         except Exception as e:
+            log.error(f"Erreur génération PDF: {e}", exc_info=True)
             st.error(f"Erreur de lecture/génération: {e}")
             st.exception(e)
             status_text.text("❌ Erreur lors de la génération")
@@ -577,6 +657,7 @@ else:
 
     with col1:
         if st.button("Générer le PDF catalogue 🚀"):
+            log.info("Début génération PDF mode standard")
             # Barre de progression
             st.session_state.progress_bar = st.progress(0)
             st.session_state.status_text = st.empty()
@@ -584,15 +665,17 @@ else:
             status_text = st.session_state.status_text
             
             try:
-                status_text.text("🔄 Préparation des données...")
-                progress_bar.progress(0.05)
+                def update_progress(progress, message):
+                    progress_bar.progress(progress)
+                    status_text.text(message)
+                    log.info(f"Progression: {progress:.1%} - {message}")
                 
-                status_text.text("🔤 Enregistrement des polices...")
+                update_progress(0.05, "🔄 Préparation des données...")
+                
+                update_progress(0.10, "🔤 Enregistrement des polices...")
                 download_and_register_fonts()
-                progress_bar.progress(0.10)
                 
-                status_text.text("📊 Pré-traitement des données...")
-                progress_bar.progress(0.15)
+                update_progress(0.15, "📊 Pré-traitement des données...")
                 
                 def safe_truncate(text, max_len):
                     s = str(text or "")
@@ -603,11 +686,9 @@ else:
                 df_pdf = df_pdf.applymap(lambda s: safe_truncate(s, max_chars))
                 products = df_pdf.to_dict(orient="records")
                 
-                status_text.text("📄 Génération de la couverture...")
-                progress_bar.progress(0.20)
+                update_progress(0.20, "📄 Génération de la couverture...")
                 
-                status_text.text("📦 Génération des pages produits...")
-                progress_bar.progress(0.25)
+                update_progress(0.25, "📦 Génération des pages produits...")
                 
                 st.session_state.pdf_bytes = safe_generate_pdf(
                     products=products,
@@ -624,25 +705,25 @@ else:
                     progress_callback=update_progress_detailed
                 )
                 
-                progress_bar.progress(0.95)
-                status_text.text("🔧 Finalisation du PDF...")
+                update_progress(0.95, "🔧 Finalisation du PDF...")
                 
-                status_text.text("💾 Sauvegarde temporaire...")
+                update_progress(0.98, "💾 Sauvegarde temporaire...")
                 tmp = Path(tempfile.gettempdir()) / st.session_state.pdf_name
                 tmp.write_bytes(st.session_state.pdf_bytes)
                 st.session_state.pdf_tmp_path = tmp
-                progress_bar.progress(0.98)
                 
-                progress_bar.progress(1.0)
-                status_text.text("✅ PDF généré avec succès !")
+                update_progress(1.0, "✅ PDF généré avec succès !")
                 
                 st.success("PDF moderne généré avec succès en Haute Définition (HD) !")
+                log.info(f"PDF généré avec succès: {len(st.session_state.pdf_bytes)} bytes")
                 
             except LayoutError as e:
+                log.error(f"Erreur de mise en page: {e}", exc_info=True)
                 st.error(f"❌ Erreur de mise en page : {e}")
                 st.info("💡 Le contenu est trop large pour la page. Essayez de réduire le nombre de colonnes ou de produits par page.")
                 status_text.text("❌ Erreur de mise en page")
             except Exception as e:
+                log.error(f"Erreur génération PDF: {e}", exc_info=True)
                 st.error(f"Erreur lors de la génération du PDF : {e}")
                 status_text.text("❌ Erreur lors de la génération")
 
