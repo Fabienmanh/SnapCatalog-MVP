@@ -1,4 +1,4 @@
-import io, re, requests, os, tempfile, time, random, logging
+import io, re, requests, os, tempfile, time, random, logging, gc, sys
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -7,6 +7,13 @@ from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+# Memory monitoring
+try:
+    import psutil
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
 
 import streamlit as st
 import pandas as pd
