@@ -173,8 +173,13 @@ def safe_fetch(url):
         circuit.record(host, False)
         raise
 
-def compress_pdf(pdf_bytes):
-    """Compresse un PDF en utilisant PyPDF2"""
+def compress_pdf(pdf_bytes, aggressive=False):
+    """Compresse un PDF en utilisant PyPDF2
+    
+    Args:
+        pdf_bytes: Bytes du PDF à compresser
+        aggressive: Si True, compression plus agressive (peut dégrader qualité)
+    """
     if not HAVE_PYPDF2:
         log.warning("PyPDF2 non disponible, compression ignorée")
         return pdf_bytes
@@ -185,6 +190,9 @@ def compress_pdf(pdf_bytes):
         writer = PdfWriter()
         
         for page in reader.pages:
+            # Compression agressive si demandé
+            if aggressive:
+                page.compress_content_streams()
             writer.add_page(page)
         
         # Préserver les métadonnées si elles existent
@@ -206,6 +214,27 @@ def compress_pdf(pdf_bytes):
     except Exception as e:
         log.warning(f"Erreur compression PDF: {e}, retour du PDF original")
         return pdf_bytes
+
+def should_split_catalog(num_products, is_cloud=False):
+    """Détermine si le catalogue doit être divisé en plusieurs PDFs
+    
+    Args:
+        num_products: Nombre de produits
+        is_cloud: True si exécuté sur Streamlit Cloud
+        
+    Returns:
+        (should_split: bool, suggested_split: int)
+    """
+    if is_cloud:
+        # Sur cloud, diviser si > 150 produits
+        if num_products > 150:
+            return True, 150
+    else:
+        # En local, diviser si > 500 produits
+        if num_products > 500:
+            return True, 250
+    
+    return False, num_products
 
 IMG_COL_RE = re.compile(r"^\s*IMAGE\s*\d+\s*$", re.I)
 URL_RE = re.compile(r"^https?://[^\s\"']+$")
@@ -572,13 +601,31 @@ if uploaded_file is not None:
         # Affichage du nombre total de produits
         total_products = len(filtered_df)
         
+        # ⚠️ ALERTE pour les gros catalogues sur Streamlit Cloud
+        is_cloud = os.getenv("STREAMLIT_CLOUD") or os.getenv("STREAMLIT_SHARING")
+        if is_cloud and total_products > 200:
+            st.error(f"⚠️ **ATTENTION : {total_products} produits détectés sur Streamlit Cloud !**")
+            st.warning("""
+            **Risques avec un catalogue volumineux sur Streamlit Cloud :**
+            - 🚨 Limite de mémoire (1GB) : risque de crash
+            - ⏱️ Timeout possible (plusieurs minutes de génération)
+            - 💾 Fichier PDF volumineux difficile à télécharger
+            
+            **Recommandations :**
+            1. **Diviser votre catalogue** en plusieurs PDFs de max 150 produits
+            2. **Utiliser la limite ci-dessous** pour tester d'abord avec 50-100 produits
+            3. **Exécuter en local** pour les gros catalogues (300+ produits)
+            """)
+        elif total_products > 150:
+            st.info(f"💡 **Conseil** : Pour {total_products} produits, la génération peut prendre plusieurs minutes. Soyez patient !")
+        
         # Limite pour les tests en mode développement
         max_products = st.number_input(
             "Limite de produits pour les tests (0 = tous)", 
             min_value=0, 
             max_value=total_products, 
-            value=min(50, total_products) if total_products > 50 else 0,
-            help="Limitez le nombre de produits pour accélérer les tests"
+            value=min(150, total_products) if is_cloud and total_products > 150 else (min(50, total_products) if total_products > 50 else 0),
+            help="⚡ Sur Streamlit Cloud, limitez à 150 produits max pour éviter les problèmes de mémoire"
         )
         
         if max_products > 0:
@@ -587,6 +634,28 @@ if uploaded_file is not None:
             st.warning(f"⚠️ Mode test: seulement {total_products} produits seront traités")
         
         st.info(f"📊 **{total_products} produits** seront traités pour la génération du PDF")
+        
+        # Option de division du catalogue
+        from utils.catalog_splitter import get_split_info, recommend_split_strategy, format_split_summary
+        
+        should_split, max_per_split, split_message = recommend_split_strategy(total_products, is_cloud=is_cloud)
+        
+        if should_split:
+            st.markdown("---")
+            st.subheader("📦 Division du Catalogue (Recommandé)")
+            st.warning(split_message)
+            
+            enable_split = st.checkbox(
+                "✂️ Diviser mon catalogue en plusieurs PDFs",
+                value=False,
+                help="Génère plusieurs PDFs plus petits au lieu d'un gros PDF pour éviter les problèmes de mémoire"
+            )
+            
+            if enable_split:
+                split_info = get_split_info(total_products, max_per_split)
+                st.info(format_split_summary(split_info))
+                st.warning("⚠️ Vous devrez générer chaque catalogue individuellement en ajustant la 'Limite de produits' ci-dessus")
+                st.info("💡 **Astuce** : Notez les plages (ex: 1-150, 151-300, etc.) et générez chaque partie séparément")
 
         # 4. Choix ressources graphiques et paramètres
         st.markdown("---")
@@ -674,12 +743,21 @@ if generation_mode == "Mode images URL (pour CSV Etsy avec URLs)":
             # Utiliser le callback de progression dans build_pdf_from_df
             pdf_bytes = build_pdf_from_df(filtered_df, progress_callback=update_progress)
             
-            # Compression du PDF
+            # Compression du PDF (agressive sur cloud)
             update_progress(0.90, "🗜️ Compression du PDF...")
-            pdf_bytes = compress_pdf(pdf_bytes)
+            is_cloud = os.getenv("STREAMLIT_CLOUD") or os.getenv("STREAMLIT_SHARING")
+            pdf_bytes = compress_pdf(pdf_bytes, aggressive=is_cloud)
+            
+            # Nettoyage mémoire
+            gc.collect()
+            log.info(f"🧹 Nettoyage mémoire après compression")
             
             st.session_state.pdf_bytes = pdf_bytes
             st.session_state.pdf_name = "catalog_images_url.pdf"
+            
+            # Vérification taille
+            pdf_size_mb = len(pdf_bytes) / 1024 / 1024
+            log.info(f"📊 Taille finale du PDF: {pdf_size_mb:.2f} MB")
 
             update_progress(0.95, "💾 Sauvegarde du fichier...")
 
@@ -746,6 +824,12 @@ else:
                 
                 update_progress(0.25, "📦 Génération des pages produits...")
                 
+                # Détection de Streamlit Cloud et ajustement automatique de la qualité
+                is_cloud = os.getenv("STREAMLIT_CLOUD") or os.getenv("STREAMLIT_SHARING")
+                if is_cloud and len(products) > 100:
+                    selected_quality = "medium"  # Forcer qualité moyenne sur cloud pour >100 produits
+                    st.info("🌐 Mode Cloud détecté : qualité automatiquement réduite pour optimiser la mémoire")
+                
                 pdf_bytes = safe_generate_pdf(
                     products=products,
                     filename=None,
@@ -761,10 +845,20 @@ else:
                     progress_callback=update_progress_detailed
                 )
                 
-                # Compression du PDF
+                # Nettoyage mémoire après génération
+                gc.collect()
+                log.info(f"🧹 Nettoyage mémoire effectué")
+                
+                # Compression du PDF (agressive sur cloud pour économiser la mémoire)
                 update_progress(0.90, "🗜️ Compression du PDF...")
-                pdf_bytes = compress_pdf(pdf_bytes)
+                pdf_bytes = compress_pdf(pdf_bytes, aggressive=is_cloud)
                 st.session_state.pdf_bytes = pdf_bytes
+                
+                # Vérification de la taille finale
+                pdf_size_mb = len(pdf_bytes) / 1024 / 1024
+                if pdf_size_mb > 100:
+                    st.warning(f"⚠️ PDF volumineux ({pdf_size_mb:.1f} MB). Le téléchargement peut être lent.")
+                log.info(f"📊 Taille finale du PDF: {pdf_size_mb:.2f} MB")
                 
                 update_progress(0.95, "🔧 Finalisation du PDF...")
                 
